@@ -17,9 +17,16 @@ jobs:
           echo "INSERT OR IGNORE INTO api_tokens (token, owner, is_master, daily_limit, requests_today, last_reset_date) VALUES ('${{ secrets.MASTER_TOKEN }}', 'Alex', 1, 0, 0, date('now'));" >> schema.sql
           echo "INSERT OR IGNORE INTO api_tokens (token, owner, is_master, daily_limit, requests_today, last_reset_date) VALUES ('${{ secrets.GUEST_TOKEN }}', 'Guest', 0, 50, 0, date('now'));" >> schema.sql
 
-      - name: Deploy to Cloudflare Workers
+      - name: Migrate D1 Database
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          command: d1 execute neurolens-db --remote --file=./schema.sql && wrangler deploy
+          command: d1 execute neurolens-db --remote --file=./schema.sql
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command: deploy
