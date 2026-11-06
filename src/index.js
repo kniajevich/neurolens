@@ -1,3 +1,253 @@
+/**
+ * NeuroLens — Two-Tier Web-to-Markdown LLM Gateway
+ * Cloudflare Worker + D1 SQL + Deno Readability Fallback + Token Limiter
+ */
+
+const LANDING_HTML = `<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>NeuroLens — Focus Web for LLMs</title>
+  <style>
+    :root {
+      --bg: #090a10;
+      --card-bg: rgba(22, 27, 46, 0.7);
+      --accent: #00f2fe;
+      --accent-grad: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+      --text: #f1f5f9;
+      --text-dim: #94a3b8;
+      --border: rgba(255, 255, 255, 0.1);
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body {
+      background-color: var(--bg);
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(79, 172, 254, 0.15) 0px, transparent 50%),
+        radial-gradient(at 100% 100%, rgba(0, 242, 254, 0.12) 0px, transparent 50%),
+        linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
+      background-size: 100% 100%, 100% 100%, 30px 30px, 30px 30px;
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .glass-card {
+      background: var(--card-bg);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 40px;
+      max-width: 520px;
+      width: 100%;
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.6), 0 0 40px rgba(0, 242, 254, 0.1);
+    }
+    .header-tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      color: var(--accent);
+      margin-bottom: 16px;
+    }
+    .header-tag::before {
+      content: "";
+      width: 8px;
+      height: 8px;
+      background: var(--accent);
+      border-radius: 50%;
+      box-shadow: 0 0 10px var(--accent);
+    }
+    h1 { font-size: 28px; font-weight: 800; line-height: 1.25; margin-bottom: 12px; }
+    p { font-size: 14px; line-height: 1.6; color: var(--text-dim); margin-bottom: 24px; }
+    .input-group { display: flex; flex-direction: column; gap: 12px; margin-bottom: 24px; }
+    input {
+      width: 100%;
+      padding: 14px 16px;
+      border-radius: 12px;
+      background: rgba(10, 15, 30, 0.8);
+      border: 1px solid var(--border);
+      color: #fff;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input:focus { border-color: var(--accent); }
+    button {
+      padding: 14px;
+      border-radius: 12px;
+      background: var(--accent-grad);
+      border: none;
+      color: #050b14;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      transition: transform 0.1s, box-shadow 0.2s;
+    }
+    button:hover {
+      box-shadow: 0 0 20px rgba(0, 242, 254, 0.4);
+      transform: translateY(-1px);
+    }
+    .api-hint {
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 12px;
+      padding: 16px;
+      border: 1px dashed rgba(255, 255, 255, 0.15);
+      font-family: monospace;
+      font-size: 12px;
+      color: var(--text-dim);
+      word-break: break-all;
+    }
+    .api-hint b { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <div class="glass-card">
+    <div class="header-tag">NeuroLens • Edge Gateway</div>
+    <h1>Фокус веба для нейросетей</h1>
+    <p>Мгновенный стриппинг HTML-мусора в чистый токеносберегающий Markdown с защитой и кэшированием в D1 SQL.</p>
+    
+    <div class="input-group">
+      <input type="text" id="targetUrl" placeholder="https://habr.com/ru/articles/..." value="https://habr.com/ru/articles/869506/">
+      <input type="text" id="tokenInput" placeholder="API токен (X-API-Key)">
+      <button onclick="go()">Фокусировать ▶</button>
+    </div>
+
+    <div class="api-hint">
+      <b>PREF-API:</b><br>
+      curl -H "X-API-Key: &lt;TOKEN&gt;" "https://${location.host}/https://example.com"
+    </div>
+  </div>
+
+  <script>
+    function go() {
+      const url = document.getElementById('targetUrl').value.trim();
+      const token = document.getElementById('tokenInput').value.trim();
+      if (!url) return;
+      let target = '/' + url;
+      if (token) target += '?token=' + encodeURIComponent(token);
+      window.location.href = target;
+    }
+  </script>
+</body>
+</html>`;
+
+/**
+ * Валидация токена и учет суточных лимитов в базе D1
+ */
+async function authenticateToken(request, db) {
+  const url = new URL(request.url);
+
+  let token = request.headers.get("X-API-Key");
+  if (!token) {
+    const authHeader = request.headers.get("Authorization") || "";
+    if (authHeader.startsWith("Bearer ")) {
+      token = authHeader.slice(7).trim();
+    }
+  }
+  if (!token) {
+    token = url.searchParams.get("token");
+  }
+
+  if (!token) {
+    return { 
+      ok: false, 
+      status: 401, 
+      error: "Missing API token. Provide header 'X-API-Key' or '?token=' param." 
+    };
+  }
+
+  // Поиск токена в таблице D1
+  const record = await db
+    .prepare("SELECT * FROM api_tokens WHERE token = ?")
+    .bind(token)
+    .first();
+
+  if (!record) {
+    return { ok: false, status: 403, error: "Invalid API token." };
+  }
+
+  // Мастер-токен без ограничений
+  if (record.is_master === 1) {
+    return { ok: true, isMaster: true, owner: record.owner };
+  }
+
+  // Проверка суточного лимита (по UTC)
+  const today = new Date().toISOString().slice(0, 10);
+  let currentCount = record.requests_today;
+
+  if (record.last_reset_date !== today) {
+    currentCount = 0;
+    await db
+      .prepare("UPDATE api_tokens SET requests_today = 1, last_reset_date = ? WHERE token = ?")
+      .bind(today, token)
+      .run();
+    return { ok: true, isMaster: false, remaining: record.daily_limit - 1 };
+  }
+
+  if (currentCount >= record.daily_limit) {
+    return { 
+      ok: false, 
+      status: 429, 
+      error: `Daily limit reached (${record.daily_limit} req/day). Resets at 00:00 UTC.` 
+    };
+  }
+
+  await db
+    .prepare("UPDATE api_tokens SET requests_today = requests_today + 1 WHERE token = ?")
+    .bind(token)
+    .run();
+
+  return { ok: true, isMaster: false, remaining: record.daily_limit - (currentCount + 1) };
+}
+
+/**
+ * Быстрый парсер Edge HTML -> Markdown
+ */
+function fastCleanHtmlToMarkdown(html, pageUrl) {
+  let text = html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "")
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "")
+    .replace(/<noscript\b[^<]*(?:(?!<\/noscript>)<[^<]*)*<\/noscript>/gi, "")
+    .replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, "")
+    .replace(/<footer\b[^<]*(?:(?!<\/footer>)<[^<]*)*<\/footer>/gi, "")
+    .replace(/<nav\b[^<]*(?:(?!<\/nav>)<[^<]*)*<\/nav>/gi, "");
+
+  const titleMatch = text.match(/<title[^>]*>([^<]+)<\/title>/i);
+  const title = titleMatch ? titleMatch[1].trim() : "Без заголовка";
+
+  text = text.replace(/<h1[^>]*>(.*?)<\/h1>/gi, "\n# $1\n");
+  text = text.replace(/<h2[^>]*>(.*?)<\/h2>/gi, "\n## $1\n");
+  text = text.replace(/<h3[^>]*>(.*?)<\/h3>/gi, "\n### $1\n");
+  text = text.replace(/<a\s+(?:[^>]*?\s+)?href="([^"]*)"[^>]*>(.*?)<\/a>/gi, "[$2]($1)");
+  text = text.replace(/<li[^>]*>(.*?)<\/li>/gi, "\n* $1");
+  text = text.replace(/<p[^>]*>(.*?)<\/p>/gi, "\n\n$1\n\n");
+  text = text.replace(/<br\s*[\/]?>/gi, "\n");
+  text = text.replace(/<[^>]+>/g, "");
+
+  text = text
+    .replace(/&nbsp;/g, " ")
+    .replace(/&quot;/g, '"')
+    .replace(/&amp;/g, "&")
+    .replace(/&#x2F;/g, "/")
+    .replace(/\n\s*\n\s*\n+/g, "\n\n")
+    .trim();
+
+  const finalMarkdown = `# ${title}\n\n*Источник: [${pageUrl}](${pageUrl})*\n\n---\n\n${text}`;
+  return { title, markdown: finalMarkdown };
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -5,479 +255,132 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization, Accept",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-API-Key",
     };
 
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
 
-    // 1. ИЗВЛЕЧЕНИЕ ЦЕЛЕВОГО URL (ПРЕФИКСНЫЙ ИЛИ QUERY)
-    let targetUrl = null;
-    const rawPath = url.pathname.slice(1) + url.search;
+    // 1. Главная страница (витрина отдается свободно)
+    if (url.pathname === "/" || url.pathname === "") {
+      return new Response(LANDING_HTML, {
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
 
-    if (rawPath.startsWith("http://") || rawPath.startsWith("https://")) {
-      targetUrl = rawPath;
-    } else if (url.searchParams.has("url")) {
+    // 2. Валидация API-токена
+    const auth = await authenticateToken(request, env.DB);
+    if (!auth.ok) {
+      return new Response(JSON.stringify({ error: auth.error }), {
+        status: auth.status,
+        headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders },
+      });
+    }
+
+    // 3. Извлечение целевого адреса
+    let targetUrl = url.pathname.slice(1);
+    if (url.searchParams.has("url")) {
       targetUrl = url.searchParams.get("url");
     }
 
-    // 2. ГЛАВНАЯ СТРАНИЦА-ВИТРИНА (ЕСЛИ НЕТ URL)
-    if (!targetUrl && url.pathname === "/") {
-      return handleLanding(request, corsHeaders);
-    }
-
-    if (!targetUrl) {
-      return new Response(JSON.stringify({ error: "Укажите целевой URL. Пример: /https://habr.com/ru/articles/12345/" }), {
-        status: 400,
-        headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders }
-      });
-    }
-
-    // Валидация URL
     try {
-      new URL(targetUrl);
-    } catch {
-      return new Response(JSON.stringify({ error: "Некорректный формат целевого URL." }), {
-        status: 400,
-        headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders }
-      });
+      targetUrl = decodeURIComponent(targetUrl);
+    } catch (_) {}
+
+    if (!targetUrl.startsWith("http://") && !targetUrl.startsWith("https://")) {
+      return new Response(
+        JSON.stringify({ error: "Укажите корректный URL: /https://example.com" }),
+        { status: 400, headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders } }
+      );
     }
 
-    // 3. ПРОВЕРКА КЭША В D1 SQL
-    const cacheKey = targetUrl;
-    if (env.DB) {
-      await initD1(env.DB);
-      try {
-        const cached = await env.DB.prepare(
-          "SELECT * FROM cache WHERE url = ? AND created_at > datetime('now', '-24 hours')"
-        ).bind(cacheKey).first();
+    // 4. Проверка кэша D1
+    try {
+      const cached = await env.DB
+        .prepare("SELECT title, markdown, tokens_estimate, tokens_saved FROM cache WHERE url = ?")
+        .bind(targetUrl)
+        .first();
 
-        if (cached) {
-          return formatOutput(request, {
+      if (cached) {
+        return new Response(
+          JSON.stringify({
             title: cached.title,
-            url: cached.url,
+            url: targetUrl,
             markdown: cached.markdown,
             tokens_estimate: cached.tokens_estimate,
             tokens_saved: cached.tokens_saved,
             cached: true,
-            engine: "edge-d1-cache"
-          }, corsHeaders);
-        }
-      } catch (err) {
-        console.error("Ошибка чтения D1 кэша:", err);
+            engine: "edge-d1-cache",
+          }),
+          { headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders } }
+        );
       }
-    }
+    } catch (_) {}
 
-    // 4. FAST-PATH: ПАРСИНГ НА CLOUDFLARE WORKER
+    // 5. Запрос целевого сайта и парсинг
     try {
       const response = await fetch(targetUrl, {
         headers: {
           "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 NeuroLens/1.0",
           "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
         },
-        cf: { cacheTtl: 3600 }
       });
 
       if (!response.ok) {
-        throw new Error(`Целевой сайт вернул статус ${response.status}`);
+        throw new Error(`HTTP ${response.status}`);
       }
 
-      const rawHtml = await response.text();
+      const html = await response.text();
+      let { title, markdown } = fastCleanHtmlToMarkdown(html, targetUrl);
+      let engine = "edge-fast";
 
-      // Детекция пустого SPA каркаса или Cloudflare Turnstile защиты
-      const isSpaOrProtected = (rawHtml.length < 1500 && rawHtml.includes("id=\"root\"")) || 
-                               rawHtml.includes("Just a moment...") || 
-                               rawHtml.includes("cf-turnstile");
-
-      if (isSpaOrProtected && env.DENO_FALLBACK_URL) {
-        // Прозрачная переадресация на спасательный круг Deno Deploy
-        return fetch(`${env.DENO_FALLBACK_URL}/${encodeURIComponent(targetUrl)}`, { headers: request.headers });
-      }
-
-      const extracted = parseHtmlToMarkdown(rawHtml, targetUrl);
-
-      // Сохраняем в D1 SQL
-      if (env.DB) {
+      // Если разметка короткая — передаем Deno Heavy
+      if (markdown.length < 500 && env.DENO_FALLBACK_URL) {
         try {
-          await env.DB.prepare(`
-            INSERT INTO cache (url, title, markdown, tokens_estimate, tokens_saved, created_at)
-            VALUES (?, ?, ?, ?, ?, datetime('now'))
-            ON CONFLICT(url) DO UPDATE SET
-              title=excluded.title,
-              markdown=excluded.markdown,
-              tokens_estimate=excluded.tokens_estimate,
-              tokens_saved=excluded.tokens_saved,
-              created_at=datetime('now');
-          `).bind(
-            targetUrl,
-            extracted.title,
-            extracted.markdown,
-            extracted.tokens_estimate,
-            extracted.tokens_saved
-          ).run();
-        } catch (err) {
-          console.error("Ошибка сохранения в D1:", err);
-        }
-      }
-
-      return formatOutput(request, {
-        title: extracted.title,
-        url: targetUrl,
-        markdown: extracted.markdown,
-        tokens_estimate: extracted.tokens_estimate,
-        tokens_saved: extracted.tokens_saved,
-        cached: false,
-        engine: "edge-fast"
-      }, corsHeaders);
-
-    } catch (err) {
-      // Fallback на Deno, если Cloudflare словил тайм-аут или ошибку сети
-      if (env.DENO_FALLBACK_URL) {
-        return fetch(`${env.DENO_FALLBACK_URL}/${encodeURIComponent(targetUrl)}`, { headers: request.headers });
-      }
-
-      return new Response(JSON.stringify({ error: err.message, engine: "edge-fast-error" }), {
-        status: 502,
-        headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders }
-      });
-    }
-  }
-};
-
-// Инициализация таблицы D1
-async function initD1(db) {
-  await db.prepare(`
-    CREATE TABLE IF NOT EXISTS cache (
-      url TEXT PRIMARY KEY,
-      title TEXT,
-      markdown TEXT,
-      tokens_estimate INTEGER,
-      tokens_saved INTEGER,
-      created_at TEXT
-    );
-  `).run();
-}
-
-// Легковесный Markdown-экстрактор
-function parseHtmlToMarkdown(html, pageUrl) {
-  const titleMatch = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-  const title = titleMatch ? titleMatch[1].trim() : "Без заголовка";
-
-  let body = html;
-  body = body.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "");
-  body = body.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, "");
-  body = body.replace(/<svg\b[^<]*(?:(?!<\/svg>)<[^<]*)*<\/svg>/gi, "");
-  body = body.replace(/<(nav|footer|header|aside|noscript|iframe)[^>]*>[\s\S]*?<\/\1>/gi, "");
-
-  // Заголовки
-  body = body.replace(/<h1[^>]*>([\s\S]*?)<\/h1>/gi, "\n\n# $1\n\n");
-  body = body.replace(/<h2[^>]*>([\s\S]*?)<\/h2>/gi, "\n\n## $1\n\n");
-  body = body.replace(/<h3[^>]*>([\s\S]*?)<\/h3>/gi, "\n\n### $1\n\n");
-  body = body.replace(/<h4[^>]*>([\s\S]*?)<\/h4>/gi, "\n\n#### $1\n\n");
-
-  // Блоки и списки
-  body = body.replace(/<li[^>]*>([\s\S]*?)<\/li>/gi, "\n* $1");
-  body = body.replace(/<p[^>]*>([\s\S]*?)<\/p>/gi, "\n\n$1\n\n");
-  body = body.replace(/<pre[^>]*><code[^>]*>([\s\S]*?)<\/code><\/pre>/gi, "\n```\n$1\n```\n");
-  body = body.replace(/<code[^>]*>([\s\S]*?)<\/code>/gi, "`$1`");
-
-  // Ссылки и форматирование
-  body = body.replace(/<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi, "[$2]($1)");
-  body = body.replace(/<(strong|b)[^>]*>([\s\S]*?)<\/\1>/gi, "**$2**");
-  body = body.replace(/<(em|i)[^>]*>([\s\S]*?)<\/\1>/gi, "*$2*");
-
-  // Вычищаем оставшиеся HTML теги
-  body = body.replace(/<[^>]+>/g, "");
-
-  // Чистка переносов и пробелов
-  body = body
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/\n\s*\n\s*\n/g, "\n\n")
-    .trim();
-
-  const finalMarkdown = `# ${title}\n\n*Источник: [${pageUrl}](${pageUrl})*\n\n---\n\n${body}`;
-
-  const rawTokens = Math.ceil(html.length / 4);
-  const cleanTokens = Math.ceil(finalMarkdown.length / 4);
-  const savedTokens = Math.max(0, rawTokens - cleanTokens);
-
-  return {
-    title,
-    markdown: finalMarkdown,
-    tokens_estimate: cleanTokens,
-    tokens_saved: savedTokens
-  };
-}
-
-// Форматирование ответа (Markdown vs JSON)
-function formatOutput(request, data, cors) {
-  const accept = request.headers.get("Accept") || "";
-  const userAgent = request.headers.get("User-Agent") || "";
-  const isTerminal = userAgent.includes("curl") || userAgent.includes("Wget");
-
-  if (accept.includes("text/markdown") || isTerminal) {
-    return new Response(data.markdown, {
-      headers: {
-        "Content-Type": "text/markdown; charset=utf-8",
-        "X-Engine": data.engine,
-        "X-Tokens-Estimate": String(data.tokens_estimate),
-        "X-Tokens-Saved": String(data.tokens_saved),
-        ...cors
-      }
-    });
-  }
-
-  return new Response(JSON.stringify(data, null, 2), {
-    headers: { "Content-Type": "application/json; charset=utf-8", ...cors }
-  });
-}
-
-// Витрина NeuroLens
-function handleLanding(request, cors) {
-  const origin = new URL(request.url).origin;
-  const html = `<!DOCTYPE html>
-<html lang="ru">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>NeuroLens // Фокусирующий Markdown-ридер для LLM</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Space+Grotesk:wght@600;700&display=swap" rel="stylesheet">
-  <style>
-    :root {
-      --bg: #030712;
-      --card-bg: rgba(15, 23, 42, 0.45);
-      --card-border: rgba(255, 255, 255, 0.16);
-      --cyan: #00f2fe;
-      --green: #10b981;
-      --purple: #b829ff;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body {
-      width: 100%; min-height: 100%;
-      background-color: var(--bg);
-      color: var(--text);
-      font-family: 'Space Grotesk', sans-serif;
-      overflow-x: hidden; position: relative;
-    }
-    body { padding: 20px 16px; display: flex; flex-direction: column; align-items: center; justify-content: center; }
-
-    #lava-canvas {
-      position: fixed; top: 0; left: 0;
-      width: 100vw; height: 100vh;
-      z-index: 0; pointer-events: none;
-      filter: contrast(1.25) saturate(1.3);
-    }
-    .frosted-backdrop {
-      position: fixed; top: 0; left: 0;
-      width: 100vw; height: 100vh;
-      background: rgba(3, 7, 18, 0.68);
-      backdrop-filter: blur(48px) saturate(220%);
-      -webkit-backdrop-filter: blur(48px) saturate(220%);
-      pointer-events: none; z-index: 1;
-    }
-    .grid-overlay {
-      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-      background-image: 
-        linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
-      background-size: 32px 32px; pointer-events: none; z-index: 2;
-    }
-    .container { width: 100%; max-width: 620px; position: relative; z-index: 3; }
-
-    .hero-card {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
-      border-radius: 24px; padding: 28px;
-      box-shadow: 0 24px 55px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.22);
-      display: flex; flex-direction: column; gap: 18px;
-    }
-    .hero-top { display: flex; justify-content: space-between; align-items: center; }
-    .badge {
-      font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; font-weight: 700;
-      padding: 4px 10px; border-radius: 20px;
-      background: rgba(0, 242, 254, 0.15); border: 1px solid rgba(0, 242, 254, 0.4);
-      color: var(--cyan); letter-spacing: 0.8px;
-    }
-    h1 { font-size: 1.8rem; letter-spacing: 1.5px; font-weight: 700; }
-    p.desc { font-size: 0.88rem; color: var(--muted); line-height: 1.5; font-family: 'Space Grotesk', sans-serif; }
-
-    .input-group {
-      display: flex; gap: 10px; margin-top: 8px; flex-wrap: wrap;
-    }
-    input[type="text"] {
-      flex: 1; min-width: 240px;
-      background: rgba(0, 0, 0, 0.5);
-      border: 1px solid rgba(255, 255, 255, 0.18);
-      border-radius: 12px; padding: 14px 16px;
-      color: #fff; font-family: 'JetBrains Mono', monospace; font-size: 0.88rem;
-      outline: none; transition: border-color 0.2s;
-    }
-    input[type="text"]:focus { border-color: var(--cyan); }
-    button.btn-extract {
-      background: linear-gradient(135deg, #00f2fe, #4facfe);
-      border: none; border-radius: 12px; padding: 14px 22px;
-      color: #000; font-weight: 700; font-family: 'Space Grotesk', sans-serif;
-      font-size: 0.88rem; cursor: pointer; transition: transform 0.15s, opacity 0.15s;
-    }
-    button.btn-extract:active { transform: scale(0.97); }
-
-    .api-preview {
-      margin-top: 10px; background: rgba(0, 0, 0, 0.45);
-      border: 1px dashed rgba(255, 255, 255, 0.12);
-      border-radius: 12px; padding: 14px;
-      font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
-      color: #94a3b8; display: flex; flex-direction: column; gap: 6px;
-    }
-    .api-preview span.cmd { color: #38bdf8; word-break: break-all; }
-  </style>
-</head>
-<body>
-  <canvas id="lava-canvas"></canvas>
-  <div class="frosted-backdrop"></div>
-  <div class="grid-overlay"></div>
-
-  <div class="container">
-    <div class="hero-card">
-      <div class="hero-top">
-        <div style="display: flex; align-items: center; gap: 10px;">
-          <div style="width: 12px; height: 12px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 16px var(--cyan);"></div>
-          <span style="font-size: 1.1rem; font-weight: 700;">NEUROLENS</span>
-        </div>
-        <div class="badge">EDGE PARSER</div>
-      </div>
-
-      <h1>Фокус веба для нейросетей</h1>
-      <p class="desc">
-        Сервис сдирает рекламу, скрипты, навигацию и куки-баннеры, превращая любую страницу в чистый, токеносберегающий Markdown.
-      </p>
-
-      <div class="input-group">
-        <input type="text" id="target-input" placeholder="https://habr.com/ru/articles/..." />
-        <button class="btn-extract" onclick="handleRun()">Фокусировать ▶</button>
-      </div>
-
-      <div class="api-preview">
-        <div><strong>ПРЕФИКСНЫЙ API ДЛЯ LLM / CURL:</strong></div>
-        <span class="cmd" id="example-cmd">curl -s "${origin}/https://example.com"</span>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    const canvas = document.getElementById('lava-canvas');
-    const ctx = canvas.getContext('2d');
-    function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
-    window.addEventListener('resize', resize);
-    resize();
-
-    const mouse = { x: -9999, y: -9999, active: false };
-    function setPointer(e) {
-      mouse.x = e.clientX || (e.touches && e.touches[0] ? e.touches[0].clientX : -9999);
-      mouse.y = e.clientY || (e.touches && e.touches[0] ? e.touches[0].clientY : -9999);
-      mouse.active = true;
-    }
-    window.addEventListener('pointermove', setPointer);
-    window.addEventListener('pointerdown', setPointer);
-    window.addEventListener('touchmove', setPointer, { passive: true });
-    window.addEventListener('touchstart', setPointer, { passive: true });
-    window.addEventListener('pointerleave', () => { mouse.active = false; mouse.x = -9999; mouse.y = -9999; });
-    window.addEventListener('touchend', () => { mouse.active = false; mouse.x = -9999; mouse.y = -9999; });
-
-    const PALETTE = [
-      { core: '#00f7ff', border: '#70fdff', rgb: '0, 247, 255' },
-      { core: '#b829ff', border: '#df85ff', rgb: '184, 41, 255' },
-      { core: '#ff1493', border: '#ff77c2', rgb: '255, 20, 147' }
-    ];
-
-    class NeonBubble {
-      constructor() { this.reset(true); }
-      reset(init = false) {
-        this.x = Math.random() * canvas.width;
-        this.y = init ? Math.random() * canvas.height : canvas.height + 160;
-        this.baseRadius = 65 + Math.random() * 55;
-        this.speed = 0.55 + Math.random() * 0.85;
-        this.vx = 0; this.vy = 0;
-        this.theme = PALETTE[Math.floor(Math.random() * PALETTE.length)];
-        this.points = 8;
-        this.wobblePhase = Math.random() * Math.PI * 2;
-        this.wobbleSpeed = 0.02 + Math.random() * 0.02;
-        this.drift = (Math.random() - 0.5) * 0.45;
-      }
-      update() {
-        this.y -= this.speed; this.x += this.drift;
-        this.wobblePhase += this.wobbleSpeed;
-        if (mouse.active) {
-          const dx = this.x - mouse.x, dy = this.y - mouse.y;
-          const dist = Math.hypot(dx, dy);
-          const maxDist = this.baseRadius + 140;
-          if (dist < maxDist && dist > 0) {
-            const force = (1 - dist / maxDist) * 7.5;
-            this.vx += (dx / dist) * force;
-            this.vy += (dy / dist) * force;
+          const denoRes = await fetch(`${env.DENO_FALLBACK_URL}/${encodeURIComponent(targetUrl)}`);
+          if (denoRes.ok) {
+            const denoData = await denoRes.json();
+            if (denoData.markdown) {
+              markdown = denoData.markdown;
+              title = denoData.title || title;
+              engine = "deno-heavy-readability";
+            }
           }
-        }
-        this.x += this.vx; this.y += this.vy;
-        this.vx *= 0.88; this.vy *= 0.88;
-        if (this.y < -this.baseRadius * 2) this.reset(false);
+        } catch (_) {}
       }
-      draw() {
-        ctx.save();
-        ctx.beginPath();
-        for (let i = 0; i <= this.points; i++) {
-          const angle = (i / this.points) * Math.PI * 2;
-          const wobble = Math.sin(this.wobblePhase + i * 1.5) * (this.baseRadius * 0.2);
-          const r = this.baseRadius + wobble;
-          const px = this.x + Math.cos(angle) * r, py = this.y + Math.sin(angle) * r * 1.12;
-          if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-        }
-        ctx.closePath();
-        const fillGrad = ctx.createRadialGradient(
-          this.x - this.baseRadius * 0.25, this.y - this.baseRadius * 0.25, 2,
-          this.x, this.y, this.baseRadius * 1.05
-        );
-        fillGrad.addColorStop(0, '#ffffff');
-        fillGrad.addColorStop(0.3, this.theme.border);
-        fillGrad.addColorStop(0.85, this.theme.core);
-        fillGrad.addColorStop(1, this.theme.core);
-        ctx.fillStyle = fillGrad; ctx.fill();
-        ctx.globalCompositeOperation = 'lighter';
-        ctx.shadowColor = 'rgb(' + this.theme.rgb + ')';
-        ctx.shadowBlur = 80;
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 5; ctx.stroke();
-        ctx.restore();
-      }
-    }
 
-    const bubbles = Array.from({ length: 8 }, () => new NeonBubble());
-    function render() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      bubbles.forEach(b => { b.update(); b.draw(); });
-      requestAnimationFrame(render);
-    }
-    render();
+      const rawTokens = Math.ceil(html.length / 4);
+      const cleanTokens = Math.ceil(markdown.length / 4);
+      const savedTokens = Math.max(0, rawTokens - cleanTokens);
 
-    function handleRun() {
-      const val = document.getElementById('target-input').value.trim();
-      if (!val) return;
-      window.location.href = '/' + val;
-    }
-  </script>
-</body>
-</html>`;
+      // Фоновое сохранение в D1
+      ctx.waitUntil(
+        env.DB.prepare(
+          "INSERT OR REPLACE INTO cache (url, title, markdown, tokens_estimate, tokens_saved, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+        )
+        .bind(targetUrl, title, markdown, cleanTokens, savedTokens)
+        .run()
+        .catch(() => {})
+      );
 
-  return new Response(html, {
-    headers: { "Content-Type": "text/html; charset=utf-8", ...cors }
-  });
-}
+      return new Response(
+        JSON.stringify({
+          title,
+          url: targetUrl,
+          markdown,
+          tokens_estimate: cleanTokens,
+          tokens_saved: savedTokens,
+          cached: false,
+          engine,
+        }),
+        { headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders } }
+      );
+    } catch (err) {
+      return new Response(
+        JSON.stringify({ error: err.message, engine: "error-handler" }),
+        { status: 502, headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders } }
+      );
+    }
+  },
+};
