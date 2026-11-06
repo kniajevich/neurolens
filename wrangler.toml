@@ -1,0 +1,12 @@
+name = "neurolens"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "neurolens-db"
+database_id = "7e9bf43a-2f51-40e1-bbd8-c6e9ecc207b5"
+
+[vars]
+DENO_FALLBACK_URL = "" # Заполним на следующем шаге
