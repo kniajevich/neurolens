@@ -126,7 +126,7 @@ const LANDING_HTML = `<!DOCTYPE html>
 
     <div class="api-hint">
       <b>PREF-API:</b><br>
-      curl -H "X-API-Key: &lt;TOKEN&gt;" "https://${location.host}/https://example.com"
+      curl -H "X-API-Key: &lt;TOKEN&gt;" "https://neurolens.goldman-ao.workers.dev/https://example.com"
     </div>
   </div>
 
@@ -335,7 +335,7 @@ export default {
       let { title, markdown } = fastCleanHtmlToMarkdown(html, targetUrl);
       let engine = "edge-fast";
 
-      // Если разметка короткая — передаем Deno Heavy
+      // Если разметка слишком короткая — передаем Deno Heavy
       if (markdown.length < 500 && env.DENO_FALLBACK_URL) {
         try {
           const denoRes = await fetch(`${env.DENO_FALLBACK_URL}/${encodeURIComponent(targetUrl)}`);
