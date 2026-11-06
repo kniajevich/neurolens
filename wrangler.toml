@@ -9,4 +9,4 @@ database_name = "neurolens-db"
 database_id = "7e9bf43a-2f51-40e1-bbd8-c6e9ecc207b5"
 
 [vars]
-DENO_FALLBACK_URL = "" # Заполним на следующем шаге
+DENO_FALLBACK_URL = "https://neurolens-engine.kniajevich1.deno.net"
